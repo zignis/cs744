@@ -61,6 +61,47 @@ int find_and_remove_last_token(char **tokens, const char *to_find) {
   return 0;
 }
 
+void split_chunks_at(char **tokens, char ***out, int *exec_mode) {
+  char *serial_delim = "&&";
+  char *parallel_delim = "&&&";
+  char **cur = (char **)malloc(MAX_NUM_TOKENS * sizeof(char *));
+  int idx = 0, out_idx = 0, cur_idx = 0;
+
+  while (1) {
+    if (tokens[idx] != NULL && *exec_mode == 0) {
+      if (strcmp(tokens[idx], serial_delim) == 0)
+        *exec_mode = 1;
+      else if (strcmp(tokens[idx], parallel_delim) == 0)
+        *exec_mode = 2;
+    }
+
+    if (tokens[idx] != NULL && strcmp(tokens[idx], serial_delim) != 0 &&
+        strcmp(tokens[idx], parallel_delim) != 0) {
+      cur[cur_idx++] = tokens[idx];
+    } else {
+      // delimiter encountered
+
+      if (cur_idx > 0) {
+        cur[cur_idx] = NULL;
+        out[out_idx++] = cur;
+      } else {
+        free(cur);
+      }
+
+      if (!tokens[idx])
+        break;
+
+      free(tokens[idx]); // dealloc the delimiter
+      cur = (char **)malloc(MAX_NUM_TOKENS * sizeof(char *));
+      cur_idx = 0;
+    }
+
+    idx++;
+  }
+
+  out[out_idx] = NULL;
+}
+
 void free_tokens(char **tokens) {
   for (int i = 0; tokens[i] != NULL; i++) {
     free(tokens[i]);
@@ -74,8 +115,7 @@ void free_tokens_and_exit(char **tokens, int exit_code) {
   exit(exit_code);
 }
 
-static void catch_sigint(int _sig) {
-}
+static void catch_sigint(int _sig) {}
 
 int main(int argc, char *argv[]) {
   // ignore SIGINTs for shell process.
@@ -87,12 +127,14 @@ int main(int argc, char *argv[]) {
     printf("failed to install signal handler\n");
     exit(EXIT_FAILURE);
   }
-  
+
   char line[MAX_INPUT_SIZE];
   char **tokens;
   char cwd[256];
   int bg_children[64] = {};
   int child_count = 0;
+  int fg_procs[64] = {};
+  int fg_proc_count = 0;
 
   while (1) {
     /* BEGIN: TAKING INPUT */
@@ -134,61 +176,90 @@ int main(int argc, char *argv[]) {
         }
       }
 
-      if (strcmp(tokens[0], "cd") == 0) {
-        if (chdir(tokens[1]) < 0) {
-          printf("invalid directory\n");
-        }
-      } else if (strcmp(tokens[0], "exit") == 0) {
-        int exit_code = 0;
+      char ***commands =
+          malloc(32 * sizeof(char **)); // max 32 commands per line
+      int exec_mode = 0; // 0=default, 1=serial, 2=parallel
+      split_chunks_at(tokens, commands, &exec_mode);
 
-        // kill all background child processes
-        for (int i = 0; i < child_count; i++) {
-          int child_pid = bg_children[i];
-          int status = kill(child_pid, SIGKILL);
+      for (int i = 0; commands[i]; i++) {
+        char **cmd = commands[i];
 
-          if (status != 0) {
-            printf("failed to kill child with pid: %d\n", child_pid);
-            exit_code = EXIT_FAILURE; // exit with errors
+        if (cmd[0] == NULL)
+          continue;
+
+        if (strcmp(cmd[0], "cd") == 0) {
+          if (chdir(cmd[1]) < 0) {
+            printf("invalid directory\n");
           }
-        }
+        } else if (strcmp(cmd[0], "exit") == 0) {
+          int exit_code = 0;
 
-        free_tokens_and_exit(tokens, exit_code);
-      } else {
-        int is_bg_proc = find_and_remove_last_token(tokens, "&");
-        pid_t pid = fork();
+          // kill all background child processes
+          for (int i = 0; i < child_count; i++) {
+            int child_pid = bg_children[i];
+            int status = kill(child_pid, SIGKILL);
 
-        if (pid < 0) {
-          printf("error forking\n");
-          free_tokens_and_exit(tokens, EXIT_FAILURE);
-        } else if (pid == 0) {
-          // move background processes to their own group
-          if (is_bg_proc) {
-            // move each process to its own process group
-            if (setpgid(0, 0) != 0) {
-              printf("failed to set process pgid");
+            if (status != 0) {
+              printf("failed to kill child with pid: %d\n", child_pid);
+              exit_code = EXIT_FAILURE; // exit with errors
             }
           }
 
-          if (execvp(tokens[0], tokens) < 0) {
-            printf("command not found\n");
-          }
+          free(commands);
+          exit(exit_code);
         } else {
-          if (is_bg_proc) {
-            bg_children[child_count++] = pid;
-          } else {
-            int status;
-            waitpid(pid, &status, 0);
+          int is_bg_proc = find_and_remove_last_token(cmd, "&");
+          pid_t pid = fork();
 
-            if (status != 0) {
-              printf("EXITSTATUS: %d\n", status);
+          if (pid < 0) {
+            printf("error forking\n");
+            free(commands);
+            exit(EXIT_FAILURE);
+          } else if (pid == 0) {
+            // move background processes to their own group
+            if (is_bg_proc) {
+              // move each process to its own process group
+              if (setpgid(0, 0) != 0) {
+                printf("failed to set process pgid");
+              }
+            }
+
+            if (execvp(cmd[0], cmd) < 0) {
+              printf("command not found\n");
+            }
+          } else {
+            if (is_bg_proc) {
+              bg_children[child_count++] = pid;
+            } else if (exec_mode == 2) {
+              fg_procs[fg_proc_count++] = pid;
+            } else {
+              int status;
+              waitpid(pid, &status, 0);
+
+              if (status != 0) {
+                printf("EXITSTATUS: %d\n", status);
+              }
             }
           }
         }
       }
-    }
 
-    // free the allocated memory
-    free_tokens(tokens);
+      // wait for all parallel processes
+      if (exec_mode == 2) {
+        for (int i = 0; i < fg_proc_count; i++) {
+          int status;
+          waitpid(fg_procs[i], &status, 0);
+
+          if (status != 0) {
+            printf("EXITSTATUS: %d\n", status);
+          }
+        }
+      }
+
+      free(commands);
+    } else {
+      free_tokens(tokens);
+    }
   }
 
   return 0;
