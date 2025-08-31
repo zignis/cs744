@@ -142,7 +142,7 @@ int main(int argc, char *argv[]) {
 
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
       printf("error getting cwd\n");
-      free_tokens_and_exit(tokens, EXIT_FAILURE);
+      exit(EXIT_FAILURE);
     }
 
     printf("%s $ ", cwd);
